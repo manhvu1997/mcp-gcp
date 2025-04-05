@@ -120,7 +120,10 @@ class GCPTools:
             zone: str,
             machine_type: str = "n1-standard-1",
             labels: Optional[Dict[str, str]] = None,
-            source_image: str = "projects/debian-cloud/global/images/family/debian-10"
+            source_image: str = "projects/debian-cloud/global/images/family/debian-10",
+            network_interfaces: Optional[List[Dict[str, Any]]] = None,
+            disks: Optional[List[Dict[str, Any]]] = None,
+            metadata: Optional[Dict[str, str]] = None
         ) -> str:
             """
             Create a new GCP instance.
@@ -131,6 +134,9 @@ class GCPTools:
                 machine_type: Machine type (e.g., n1-standard-1)
                 labels: Labels to attach to the instance (e.g., {"env": "prod", "project": "demo"})
                 source_image: Source image to use for the instance (e.g., "projects/debian-cloud/global/images/family/debian-10")
+                network_interfaces: Network interfaces configuration
+                disks: Disks configuration
+                metadata: Metadata configuration
             """
             try:
                 # Handle None values
@@ -142,7 +148,10 @@ class GCPTools:
                     machine_type=machine_type,
                     zone=zone,
                     labels=labels,
-                    source_image=source_image
+                    source_image=source_image,
+                    network_interfaces=network_interfaces,
+                    disks=disks,
+                    metadata=metadata
                 )
                 
                 # Check if instance already exists
@@ -240,14 +249,26 @@ class GCPTools:
         
         # Modify instance tool
         @self.mcp.tool()
-        async def update_instance_labels(name: str, zone: str, labels: Dict[str, str]) -> str:
+        async def modify_instance(
+            name: str,
+            zone: str,
+            machine_type: Optional[str] = None,
+            network_interfaces: Optional[List[Dict[str, Any]]] = None,
+            disks: Optional[List[Dict[str, Any]]] = None,
+            labels: Optional[Dict[str, str]] = None,
+            metadata: Optional[Dict[str, str]] = None
+        ) -> str:
             """
-            Update labels on a GCP instance.
+            Modify a GCP instance with comprehensive changes.
             
             Args:
-                name: Name of the instance to update
+                name: Name of the instance to modify
                 zone: Zone where the instance is located
-                labels: New labels to set on the instance
+                machine_type: New machine type to set (e.g., n2-standard-4)
+                network_interfaces: New network interfaces configuration
+                disks: New disks configuration
+                labels: New labels to set
+                metadata: New metadata to set
             """
             try:
                 # Check if instance exists
@@ -256,20 +277,35 @@ class GCPTools:
                     return f"Instance '{name}' not found in zone {zone}."
                 
                 # Modify the instance
-                result = self.gcp_service.modify_instance(zone, name, labels=labels)
+                result = self.gcp_service.modify_instance(
+                    zone=zone,
+                    name=name,
+                    machine_type=machine_type,
+                    network_interfaces=network_interfaces,
+                    disks=disks,
+                    labels=labels,
+                    metadata=metadata
+                )
                 
                 # Format response
-                result_str = f"Updating labels for instance '{name}' in zone {zone}.\n"
-                result_str += "New labels:\n"
-                for k, v in labels.items():
-                    result_str += f"  - {k}: {v}\n"
+                result_str = f"Modifying instance '{name}' in zone {zone}.\n"
+                if machine_type:
+                    result_str += f"  - Machine Type: {machine_type}\n"
+                if network_interfaces:
+                    result_str += "  - Network Interfaces: Updated\n"
+                if disks:
+                    result_str += "  - Disks: Updated\n"
+                if labels:
+                    result_str += "  - Labels: Updated\n"
+                if metadata:
+                    result_str += "  - Metadata: Updated\n"
+                result_str += f"Operation: {result.name}, Status: {result.status}"
                 
                 return result_str
             except Exception as e:
-                logger.error(f"Error updating instance labels: {e}")
-                return f"Failed to update labels for instance '{name}' in zone {zone}: {str(e)}"
+                logger.error(f"Error modifying instance: {e}")
+                return f"Failed to modify instance '{name}' in zone {zone}: {str(e)}"
         
-        # Restart instance tool
         @self.mcp.tool()
         async def restart_instance(name: str, zone: str) -> str:
             """
@@ -299,3 +335,169 @@ class GCPTools:
             except Exception as e:
                 logger.error(f"Error restarting instance: {e}")
                 return f"Failed to restart instance '{name}' in zone {zone}: {str(e)}"
+        
+        @self.mcp.tool()
+        async def add_disk(
+            name: str,
+            zone: str,
+            disk_name: str,
+            size_gb: int = 10,
+            disk_type: str = "pd-standard",
+            auto_delete: bool = True,
+            mode: str = "READ_WRITE"
+        ) -> str:
+            """
+            Add a new disk to an existing instance.
+            
+            Args:
+                name: Name of the instance
+                zone: Zone where the instance is located
+                disk_name: Name for the new disk
+                size_gb: Size of the disk in GB (default: 10)
+                disk_type: Type of disk (default: pd-standard)
+                auto_delete: Whether to auto-delete when instance is deleted (default: True)
+                mode: Mode of attachment (READ_WRITE or READ_ONLY, default: READ_WRITE)
+            """
+            try:
+                # Check if instance exists
+                existing = self.gcp_service.get_instance(zone, name)
+                if not existing:
+                    return f"Instance '{name}' not found in zone {zone}."
+                
+                # Prepare disk configuration
+                disk_config = {
+                    'name': disk_name,
+                    'size_gb': size_gb,
+                    'disk_type': disk_type,
+                    'auto_delete': auto_delete,
+                    'mode': mode
+                }
+                
+                # Add the disk
+                result = self.gcp_service.add_disk(zone, name, disk_config)
+                
+                return f"Adding disk '{disk_name}' to instance '{name}' in zone {zone}.\n" \
+                       f"Size: {size_gb}GB, Type: {disk_type}, Mode: {mode}\n" \
+                       f"Operation: {result.name}, Status: {result.status}"
+            except Exception as e:
+                logger.error(f"Error adding disk: {e}")
+                return f"Failed to add disk to instance '{name}' in zone {zone}: {str(e)}"
+        
+        @self.mcp.tool()
+        async def modify_disk(
+            name: str,
+            zone: str,
+            disk_name: str,
+            size_gb: Optional[int] = None,
+            disk_type: Optional[str] = None
+        ) -> str:
+            """
+            Modify an existing disk attached to an instance.
+            
+            Args:
+                name: Name of the instance
+                zone: Zone where the instance is located
+                disk_name: Name of the disk to modify
+                size_gb: New size in GB
+                disk_type: New disk type (e.g., pd-standard, pd-ssd)
+            """
+            try:
+                # Check if instance exists
+                existing = self.gcp_service.get_instance(zone, name)
+                if not existing:
+                    return f"Instance '{name}' not found in zone {zone}."
+                
+                # Modify the disk
+                result = self.gcp_service.modify_disk(
+                    zone=zone,
+                    name=name,
+                    disk_name=disk_name,
+                    size_gb=size_gb,
+                    disk_type=disk_type
+                )
+                
+                # Format response
+                result_str = f"Modifying disk '{disk_name}' on instance '{name}' in zone {zone}.\n"
+                if size_gb:
+                    result_str += f"  - New size: {size_gb}GB\n"
+                if disk_type:
+                    result_str += f"  - New type: {disk_type}\n"
+                result_str += f"Operation: {result.name}, Status: {result.status}"
+                
+                return result_str
+            except Exception as e:
+                logger.error(f"Error modifying disk: {e}")
+                return f"Failed to modify disk on instance '{name}' in zone {zone}: {str(e)}"
+        
+        @self.mcp.tool()
+        async def attach_disk(
+            name: str,
+            zone: str,
+            disk_name: str,
+            auto_delete: bool = True,
+            mode: str = "READ_WRITE"
+        ) -> str:
+            """
+            Attach an existing disk to an instance.
+            
+            Args:
+                name: Name of the instance
+                zone: Zone where the instance is located
+                disk_name: Name of the disk to attach
+                auto_delete: Whether to auto-delete when instance is deleted (default: True)
+                mode: Mode of attachment (READ_WRITE or READ_ONLY, default: READ_WRITE)
+            """
+            try:
+                # Check if instance exists
+                existing = self.gcp_service.get_instance(zone, name)
+                if not existing:
+                    return f"Instance '{name}' not found in zone {zone}."
+                
+                # Attach the disk
+                result = self.gcp_service.attach_disk(
+                    zone=zone,
+                    name=name,
+                    disk_name=disk_name,
+                    auto_delete=auto_delete,
+                    mode=mode
+                )
+                
+                return f"Attaching disk '{disk_name}' to instance '{name}' in zone {zone}.\n" \
+                       f"Mode: {mode}, Auto-delete: {auto_delete}\n" \
+                       f"Operation: {result.name}, Status: {result.status}"
+            except Exception as e:
+                logger.error(f"Error attaching disk: {e}")
+                return f"Failed to attach disk to instance '{name}' in zone {zone}: {str(e)}"
+        
+        @self.mcp.tool()
+        async def detach_disk(
+            name: str,
+            zone: str,
+            device_name: str
+        ) -> str:
+            """
+            Detach a disk from an instance.
+            
+            Args:
+                name: Name of the instance
+                zone: Zone where the instance is located
+                device_name: Device name of the disk to detach
+            """
+            try:
+                # Check if instance exists
+                existing = self.gcp_service.get_instance(zone, name)
+                if not existing:
+                    return f"Instance '{name}' not found in zone {zone}."
+                
+                # Detach the disk
+                result = self.gcp_service.detach_disk(
+                    zone=zone,
+                    name=name,
+                    device_name=device_name
+                )
+                
+                return f"Detaching disk '{device_name}' from instance '{name}' in zone {zone}.\n" \
+                       f"Operation: {result.name}, Status: {result.status}"
+            except Exception as e:
+                logger.error(f"Error detaching disk: {e}")
+                return f"Failed to detach disk from instance '{name}' in zone {zone}: {str(e)}"

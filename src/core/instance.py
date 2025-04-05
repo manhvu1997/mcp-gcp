@@ -9,6 +9,8 @@ from mcp.types import Request, Result
 from pydantic import BaseModel, Field
 from src.models.models import GCPInstance, GCPInstanceList, GCPOperationResult
 from src.server.config import logger
+import time
+
 class GCPService:
     """
     Service for interacting with GCP Compute Engine API.
@@ -234,14 +236,21 @@ class GCPService:
             logger.error(f"Error deleting instance {name}: {e}")
             raise
     
-    def modify_instance(self, zone: str, name: str, labels: Dict[str, str] = None, 
-                       metadata: Dict[str, str] = None) -> GCPOperationResult:
+    def modify_instance(self, zone: str, name: str, 
+                       machine_type: Optional[str] = None,
+                       network_interfaces: Optional[List[Dict[str, Any]]] = None,
+                       disks: Optional[List[Dict[str, Any]]] = None,
+                       labels: Optional[Dict[str, str]] = None,
+                       metadata: Optional[Dict[str, str]] = None) -> GCPOperationResult:
         """
-        Modify an existing instance (labels and/or metadata).
+        Modify an existing instance with comprehensive changes.
         
         Args:
             zone: The zone where the instance is located
             name: The name of the instance to modify
+            machine_type: New machine type to set
+            network_interfaces: New network interfaces configuration
+            disks: New disks configuration
             labels: New labels to set
             metadata: New metadata to set
             
@@ -249,12 +258,27 @@ class GCPService:
             GCPOperationResult: The result of the modify operation
         """
         try:
-            # Get the fingerprint of the instance for optimistic locking
+            # Get the current instance configuration
             instance = self.compute_service.instances().get(
                 project=self.project_id,
                 zone=zone,
                 instance=name
             ).execute()
+            
+            # Prepare the instance configuration for update
+            config = {}
+            
+            # Update machine type if provided
+            if machine_type is not None:
+                config['machineType'] = f"zones/{zone}/machineTypes/{machine_type}"
+            
+            # Update network interfaces if provided
+            if network_interfaces is not None:
+                config['networkInterfaces'] = network_interfaces
+            
+            # Update disks if provided
+            if disks is not None:
+                config['disks'] = disks
             
             # Update labels if provided
             if labels is not None:
@@ -281,16 +305,111 @@ class GCPService:
                     }
                 ).execute()
             
-            # Return the operation result
-            operation = label_req if labels is not None else metadata_req
-            return GCPOperationResult(
-                name=operation.get('name', ''),
-                status=operation.get('status', ''),
-                operation_type='modify',
-                target_id=operation.get('targetId')
-            )
+            # If there are configuration changes, update the instance
+            if config:
+                # Create a new instance configuration that preserves existing fields
+                update_config = {
+                    'name': name,
+                    'machineType': config.get('machineType', instance.get('machineType')),
+                    'networkInterfaces': config.get('networkInterfaces', instance.get('networkInterfaces')),
+                    'disks': config.get('disks', instance.get('disks')),
+                    'metadata': instance.get('metadata', {}),
+                    'labels': instance.get('labels', {})
+                }
+                
+                # Remove any None values to prevent API errors
+                update_config = {k: v for k, v in update_config.items() if v is not None}
+                
+                operation = self.compute_service.instances().update(
+                    project=self.project_id,
+                    zone=zone,
+                    instance=name,
+                    body=update_config
+                ).execute()
+                return GCPOperationResult(
+                    name=operation.get('name', ''),
+                    status=operation.get('status', ''),
+                    operation_type='modify',
+                    target_id=operation.get('targetId')
+                )
+            
+            # If only labels or metadata were updated, return that operation result
+            if labels is not None:
+                return GCPOperationResult(
+                    name=label_req.get('name', ''),
+                    status=label_req.get('status', ''),
+                    operation_type='modify_labels',
+                    target_id=label_req.get('targetId')
+                )
+            elif metadata is not None:
+                return GCPOperationResult(
+                    name=metadata_req.get('name', ''),
+                    status=metadata_req.get('status', ''),
+                    operation_type='modify_metadata',
+                    target_id=metadata_req.get('targetId')
+                )
+            
+            raise ValueError("No modifications specified")
+            
         except Exception as e:
             logger.error(f"Error modifying instance {name}: {e}")
+            raise
+
+    def modify_instance_with_restart(self, zone: str, name: str,
+                                   machine_type: Optional[str] = None,
+                                   network_interfaces: Optional[List[Dict[str, Any]]] = None,
+                                   disks: Optional[List[Dict[str, Any]]] = None,
+                                   labels: Optional[Dict[str, str]] = None,
+                                   metadata: Optional[Dict[str, str]] = None) -> List[GCPOperationResult]:
+        """
+        Modify an instance with a stop-edit-start workflow for changes that require instance restart.
+        
+        Args:
+            zone: The zone where the instance is located
+            name: The name of the instance to modify
+            machine_type: New machine type to set
+            network_interfaces: New network interfaces configuration
+            disks: New disks configuration
+            labels: New labels to set
+            metadata: New metadata to set
+            
+        Returns:
+            List[GCPOperationResult]: List of operation results for stop, modify, and start operations
+        """
+        try:
+            results = []
+            
+            # Stop the instance
+            stop_result = self.stop_instance(zone, name)
+            results.append(stop_result)
+            
+            # Wait for the instance to stop
+            while True:
+                instance = self.get_instance(zone, name)
+                if instance and instance.status == "TERMINATED":
+                    break
+                time.sleep(5)  # Wait 5 seconds before checking again
+            
+            # Modify the instance
+            modify_result = self.modify_instance(
+                zone=zone,
+                name=name,
+                machine_type=machine_type,
+                network_interfaces=network_interfaces,
+                disks=disks,
+                labels=labels,
+                metadata=metadata
+            )
+            results.append(modify_result)
+            
+            # Start the instance
+            start_result = self.start_instance(zone, name)
+            results.append(start_result)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in stop-edit-start workflow for instance {name}: {e}")
             raise
     
     def stop_instance(self, zone: str, name: str) -> GCPOperationResult:
@@ -347,4 +466,225 @@ class GCPService:
             )
         except Exception as e:
             logger.error(f"Error starting instance {name}: {e}")
+            raise
+
+    def add_disk(self, zone: str, name: str, disk_config: Dict[str, Any]) -> GCPOperationResult:
+        """
+        Add a new disk to an existing instance.
+        
+        Args:
+            zone: The zone where the instance is located
+            name: The name of the instance
+            disk_config: Configuration for the new disk, including:
+                - name: Name of the disk
+                - size_gb: Size in GB
+                - disk_type: Type of disk (e.g., pd-standard, pd-ssd)
+                - auto_delete: Whether to auto-delete when instance is deleted
+                - mode: Mode of attachment (READ_WRITE or READ_ONLY)
+                
+        Returns:
+            GCPOperationResult: The result of the add disk operation
+        """
+        try:
+            # Get the current instance configuration
+            instance = self.compute_service.instances().get(
+                project=self.project_id,
+                zone=zone,
+                instance=name
+            ).execute()
+            
+            # Prepare the disk configuration
+            disk_name = disk_config.get('name')
+            disk_type = disk_config.get('disk_type', 'pd-standard')
+            size_gb = disk_config.get('size_gb', 10)
+            auto_delete = disk_config.get('auto_delete', True)
+            mode = disk_config.get('mode', 'READ_WRITE')
+            
+            # Create the disk
+            disk_body = {
+                'name': disk_name,
+                'sizeGb': size_gb,
+                'type': f"zones/{zone}/diskTypes/{disk_type}",
+                'autoDelete': auto_delete
+            }
+            
+            # Create the disk first
+            disk_operation = self.compute_service.disks().insert(
+                project=self.project_id,
+                zone=zone,
+                body=disk_body
+            ).execute()
+            
+            # Wait for disk creation to complete
+            while True:
+                disk = self.compute_service.disks().get(
+                    project=self.project_id,
+                    zone=zone,
+                    disk=disk_name
+                ).execute()
+                if disk.get('status') == 'READY':
+                    break
+                time.sleep(5)
+            
+            # Attach the disk to the instance
+            attach_body = {
+                'source': f"projects/{self.project_id}/zones/{zone}/disks/{disk_name}",
+                'autoDelete': auto_delete,
+                'mode': mode
+            }
+            
+            operation = self.compute_service.instances().attachDisk(
+                project=self.project_id,
+                zone=zone,
+                instance=name,
+                body=attach_body
+            ).execute()
+            
+            return GCPOperationResult(
+                name=operation.get('name', ''),
+                status=operation.get('status', ''),
+                operation_type='add_disk',
+                target_id=operation.get('targetId')
+            )
+            
+        except Exception as e:
+            logger.error(f"Error adding disk to instance {name}: {e}")
+            raise
+
+    def modify_disk(self, zone: str, name: str, disk_name: str, 
+                   size_gb: Optional[int] = None,
+                   disk_type: Optional[str] = None) -> GCPOperationResult:
+        """
+        Modify an existing disk attached to an instance.
+        
+        Args:
+            zone: The zone where the instance is located
+            name: The name of the instance
+            disk_name: The name of the disk to modify
+            size_gb: New size in GB
+            disk_type: New disk type (e.g., pd-standard, pd-ssd)
+            
+        Returns:
+            GCPOperationResult: The result of the modify disk operation
+        """
+        try:
+            # Get the current disk configuration
+            disk = self.compute_service.disks().get(
+                project=self.project_id,
+                zone=zone,
+                disk=disk_name
+            ).execute()
+            
+            # Prepare the update configuration
+            update_config = {}
+            
+            if size_gb is not None:
+                update_config['sizeGb'] = size_gb
+            
+            if disk_type is not None:
+                update_config['type'] = f"zones/{zone}/diskTypes/{disk_type}"
+            
+            if not update_config:
+                raise ValueError("No modifications specified for disk")
+            
+            # Update the disk
+            operation = self.compute_service.disks().update(
+                project=self.project_id,
+                zone=zone,
+                disk=disk_name,
+                body=update_config
+            ).execute()
+            
+            return GCPOperationResult(
+                name=operation.get('name', ''),
+                status=operation.get('status', ''),
+                operation_type='modify_disk',
+                target_id=operation.get('targetId')
+            )
+            
+        except Exception as e:
+            logger.error(f"Error modifying disk {disk_name} on instance {name}: {e}")
+            raise
+
+    def attach_disk(self, zone: str, name: str, disk_name: str,
+                   auto_delete: bool = True,
+                   mode: str = 'READ_WRITE') -> GCPOperationResult:
+        """
+        Attach an existing disk to an instance.
+        
+        Args:
+            zone: The zone where the instance is located
+            name: The name of the instance
+            disk_name: The name of the disk to attach
+            auto_delete: Whether to auto-delete when instance is deleted
+            mode: Mode of attachment (READ_WRITE or READ_ONLY)
+            
+        Returns:
+            GCPOperationResult: The result of the attach disk operation
+        """
+        try:
+            # Check if disk exists
+            disk = self.compute_service.disks().get(
+                project=self.project_id,
+                zone=zone,
+                disk=disk_name
+            ).execute()
+            
+            if not disk:
+                raise ValueError(f"Disk {disk_name} not found in zone {zone}")
+            
+            # Attach the disk
+            attach_body = {
+                'source': f"projects/{self.project_id}/zones/{zone}/disks/{disk_name}",
+                'autoDelete': auto_delete,
+                'mode': mode
+            }
+            
+            operation = self.compute_service.instances().attachDisk(
+                project=self.project_id,
+                zone=zone,
+                instance=name,
+                body=attach_body
+            ).execute()
+            
+            return GCPOperationResult(
+                name=operation.get('name', ''),
+                status=operation.get('status', ''),
+                operation_type='attach_disk',
+                target_id=operation.get('targetId')
+            )
+            
+        except Exception as e:
+            logger.error(f"Error attaching disk {disk_name} to instance {name}: {e}")
+            raise
+
+    def detach_disk(self, zone: str, name: str, device_name: str) -> GCPOperationResult:
+        """
+        Detach a disk from an instance.
+        
+        Args:
+            zone: The zone where the instance is located
+            name: The name of the instance
+            device_name: The device name of the disk to detach
+            
+        Returns:
+            GCPOperationResult: The result of the detach disk operation
+        """
+        try:
+            operation = self.compute_service.instances().detachDisk(
+                project=self.project_id,
+                zone=zone,
+                instance=name,
+                deviceName=device_name
+            ).execute()
+            
+            return GCPOperationResult(
+                name=operation.get('name', ''),
+                status=operation.get('status', ''),
+                operation_type='detach_disk',
+                target_id=operation.get('targetId')
+            )
+            
+        except Exception as e:
+            logger.error(f"Error detaching disk {device_name} from instance {name}: {e}")
             raise

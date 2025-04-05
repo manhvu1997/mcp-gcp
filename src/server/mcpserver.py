@@ -9,7 +9,8 @@ from mcp.server.fastmcp import FastMCP
 from src.server.config import MCP_HOST, MCP_PORT, GCP_PROJECT_ID, GCP_CREDENTIALS_PATH  
 from src.core.instance import GCPService
 from src.handler.tools import GCPTools
-
+from src.handler.gke_tools import GKETools
+from src.core.gke_service import GKEService
 logger = logging.getLogger(__name__)
 
 class MCPServer:
@@ -39,8 +40,15 @@ class MCPServer:
             credentials_path=self.credentials_path
         )
         
+        # Initialize GKE service
+        self.gke_service = GKEService(
+            project_id=self.project_id,
+            credentials_path=self.credentials_path
+        )
+        
         # Initialize and register tools
-        self.tools = None
+        self.gcp_tools = None
+        self.gke_tools = None
     
     def setup(self):
         """Setup the MCP server and components."""
@@ -48,8 +56,12 @@ class MCPServer:
             # Initialize GCP service
             self.gcp_service.initialize()
             
+            # Initialize GKE service
+            self.gke_service.initialize()
+            
             # Register tools with MCP
-            self.tools = GCPTools(self.gcp_service, self.mcp)
+            self.gcp_tools = GCPTools(self.gcp_service, self.mcp)
+            self.gke_tools = GKETools(self.gke_service, self.mcp)
             
             logger.info(f"MCP server setup complete with tools registered")
         except Exception as e:
