@@ -84,7 +84,7 @@ class MCPServer:
             if transport_args is None:
                 transport_args = {}
                 
-                if transport == 'stdio':
+                if transport == 'sse':
                     transport_args = {
                         'host': MCP_HOST,
                         'port': MCP_PORT
